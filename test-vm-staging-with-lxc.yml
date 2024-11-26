@@ -1,0 +1,334 @@
+---
+    - name: Deploy Ubuntu VM on Proxmox using NetBox with dynamic cluster, platform, and storage
+      hosts: localhost
+      gather_facts: no
+      vars:
+        netbox_url: "{{ lookup('env', 'NETBOX_URL') }}"
+        netbox_api_token: "{{ lookup('env', 'NETBOX_API_TOKEN') }}"
+        api_user: "{{ lookup('env', 'PROXMOX_API_USER') }}"
+        api_token: "{{ lookup('env', 'PROXMOX_API_TOKEN') }}"
+        netbox_vm_id: "{{ NETBOX_VMLXC_ID | int }}"  # Passed via extra-vars
+      tasks:
+        - name: Get VM details from NetBox
+          uri:
+            url: "{{ netbox_url }}/api/virtualization/virtual-machines/{{ netbox_vm_id }}/"
+            method: GET
+            headers:
+              Authorization: "Token {{ netbox_api_token }}"
+            return_content: yes
+            status_code: 200
+          register: netbox_vm
+    
+        - name: Parse VM details from NetBox
+          set_fact:
+            vm_name: "{{ netbox_vm.json.name }}"
+            vm_cpus: "{{ netbox_vm.json.vcpus | default(2) }}"
+            vm_memory: "{{ netbox_vm.json.memory | default(2048) }}"
+            vm_ip: "{{ netbox_vm.json.primary_ip4.address.split('/')[0] }}"
+            vm_gateway: "{{ netbox_vm.json.custom_fields['gateway'] | default('192.168.54.1') }}"
+            vm_netmask: "{{ netbox_vm.json.primary_ip4.address.split('/')[1] | default('24') }}"
+            vm_platform_slug: "{{ netbox_vm.json.platform.slug }}"
+            assigned_device_id: "{{ netbox_vm.json.device.id }}"
+            
+            
+    
+        - name: Get device details for assigned VM host
+          uri:
+            url: "{{ netbox_url }}/api/dcim/devices/{{ assigned_device_id }}/"
+            method: GET
+            headers:
+              Authorization: "Token {{ netbox_api_token }}"
+            return_content: yes
+            status_code: 200
+          register: device_details
+      
+
+        - name: Fetch IP details of the Proxmox host
+          uri:
+            url: "{{ netbox_url }}/api/ipam/ip-addresses/{{ device_details.json.primary_ip4.id }}/"
+            method: GET
+            headers:
+              Authorization: "Token {{ netbox_api_token }}"
+            return_content: yes
+            status_code: 200
+          register: ip_details
+
+        - name: Parse Proxmox host and node details
+          set_fact:
+            proxmox_host: "{{ ip_details.json.dns_name }}"
+            target_vm_node: "{{ device_details.json.description }}"
+      
+        - name: Get virtual disks assigned to the VM
+          uri:
+            url: "{{ netbox_url }}/api/virtualization/virtual-disks/"
+            method: GET
+            headers:
+              Authorization: "Token {{ netbox_api_token }}"
+            return_content: yes
+            status_code: 200
+          register: virtual_disks
+      
+        - name: Filter virtual disks for the target VM
+          set_fact:
+            vm_disks: "{{ virtual_disks.json.results | selectattr('virtual_machine.id', 'equalto', netbox_vm_id | int) | list }}"
+      
+        - name: Ensure VM has at least one disk
+          fail:
+            msg: "No disks found for VM ID {{ netbox_vm_id }}."
+          when: vm_disks | length == 0
+      
+        - name: Extract storage tag from the first disk
+          set_fact:
+            vm_disk: "{{ (vm_disks[0].tags | map(attribute='name') | list | first | default('local-lvm')) }}"
+            vm_disk_size: "{{ vm_disks[0].size | int | default(10240) }}"
+      
+        - name: Use platform slug as the Proxmox template
+          set_fact:
+            vm_template: "{{ vm_platform_slug }}"
+
+        - name: Determine deployment type
+          set_fact:
+            deployment_type: >-
+              {{ 'lxc' if 'lxc' in vm_platform_slug.lower() else 'qemu' }}
+      
+        - name: Get the next available VM ID from Proxmox
+          uri:
+            url: "https://{{ proxmox_host }}:8006/api2/json/cluster/nextid"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ api_token }}"
+            return_content: yes
+          register: next_vm_id
+
+        - name: Set the target VM ID
+          set_fact:
+            target_vm_id: "{{ next_vm_id.json.data }}"
+
+
+# Handle LXC container creation
+        - name: Deploy LXC container
+          when: deployment_type == 'lxc'
+          block:
+            - name: Set template to use from netbox
+              set_fact:
+                proxmox_template: "{{ netbox_vm.json.config_context.proxmox_template }}"
+
+            - name: Fetch LXC templates from Proxmox
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/storage/local/content"
+                method: GET
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                return_content: yes
+              register: proxmox_templates
+
+            - name: Format rootfs parameter
+              set_fact:
+                lxc_rootfs: "{{ vm_disk }}:{{ vm_disk_size | int // 1024 }}"
+
+
+            - name: Clone LXC container from template
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/lxc/"
+                method: POST
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                body_format: json
+                body:
+                  vmid: "{{ target_vm_id }}"
+                  hostname: "{{ vm_name }}"
+                  rootfs: "{{ lxc_rootfs }}"
+                  ostemplate: "{{ proxmox_template }}"
+                  memory: "{{ vm_memory }}"
+                  cores: "{{ vm_cpus | int }}"
+                  unprivileged: true
+                  net0: "name=eth0,bridge=vmbr0,ip={{ vm_ip }}/{{ vm_netmask }},gw={{ vm_gateway }}"
+                  tags: "netbox-created"
+                  description: "NetBox LXC link: {{ netbox_url }}/virtualization/virtual-machines/{{ netbox_vm_id }}/"
+                  password: "password"
+                status_code: 200, 201
+              register: lxc_clone_task
+
+            - name: Extract UPID from LXC cloning task
+              set_fact:
+                clone_upid: "{{ lxc_clone_task.json.data }}"
+
+            - name: Wait for LXC cloning task to finish
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/tasks/{{ clone_upid }}/status"
+                method: GET
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                return_content: yes
+              register: lxc_task_status
+              until: lxc_task_status.json.data.status == "stopped" or lxc_task_status.json.data.status == "failed"
+              retries: 30
+              delay: 10
+
+            - name: Check for LXC cloning task failure
+              fail:
+                msg: "LXC cloning task failed"
+              when: lxc_task_status.json.data.status == "failed"
+
+
+            - name: Start the LXC container
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/lxc/{{ target_vm_id }}/status/start"
+                method: POST
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                status_code: 200
+
+
+        - name: Deploy VM
+          when: deployment_type == 'qemu'
+          block:
+            - name: Get VM templates from Proxmox node
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/qemu"
+                method: GET
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                return_content: yes
+                status_code: 200
+              register: templates_list
+
+            - name: Extract template ID by platform slug
+              set_fact:
+                vm_template_id: >-
+                  {{
+                    templates_list.json.data
+                    | selectattr('template', 'defined')
+                    | selectattr('template', 'equalto', 1)
+                    | selectattr('name', 'equalto', vm_template)
+                    | map(attribute='vmid')
+                    | first
+                  }}
+
+            - name: Clone VM from template
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/qemu/{{ vm_template_id }}/clone"
+                method: POST
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                body_format: json
+                body:
+                  newid: "{{ target_vm_id }}"
+                  name: "{{ vm_name }}"
+                  full: true
+                  storage: "{{ vm_disk }}"
+                status_code: 200, 201
+              register: clone_task
+        
+        
+            - name: Extract UPID from cloning task
+              set_fact:
+                clone_upid: "{{ clone_task.json.data }}"
+
+            - name: Wait for cloning task to finish
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/tasks/{{ clone_upid }}/status"
+                method: GET
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                return_content: yes
+              register: task_status
+              until: task_status.json.data.status == "stopped" or task_status.json.data.status == "failed"
+              retries: 30   # Set the number of retries before giving up
+              delay: 10     # Wait 10 seconds between each retry
+          
+            - name: Check for cloning task failure
+              fail:
+                msg: "Cloning task failed"
+              when: task_status.json.data.status == "failed"
+      
+            - name: Configure VM hardware
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/qemu/{{ target_vm_id }}/config"
+                method: PUT
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                body_format: json
+                body:
+                  cores: "{{ vm_cpus | int }}"
+                  memory: "{{ vm_memory }}"
+                  net0: "virtio,bridge=vmbr0"
+                  tags: "netbox-created"
+                  description: "NetBox VM link: {{ netbox_url }}/virtualization/virtual-machines/{{ netbox_vm_id }}/"
+                status_code: 200
+          
+            - name: Configure Cloud-Init network settings
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/qemu/{{ target_vm_id }}/config"
+                method: PUT
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                body_format: json
+                body:
+                  ipconfig0: "ip={{ vm_ip }}/{{ vm_netmask }},gw={{ vm_gateway }}"
+                  ciupgrade: true
+                status_code: 200
+      
+            - name: Start the VM
+              uri:
+                url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ target_vm_node }}/qemu/{{ target_vm_id }}/status/start"
+                method: POST
+                headers:
+                  Authorization: "Bearer {{ api_token }}"
+                status_code: 200
+      
+            - name: Wait for VM to be ready
+              wait_for:
+                host: "{{ vm_ip }}"
+                port: 22
+                timeout: 300
+                state: started
+
+            - name: Add 'pve-provisioned' tag to the VM in NetBox
+              uri:
+                url: "{{ netbox_url }}/api/virtualization/virtual-machines/{{ netbox_vm_id }}/"
+                method: PATCH
+                headers:
+                  Authorization: "Token {{ netbox_api_token }}"
+                body:
+                  tags:
+                    - 5
+                body_format: json
+                status_code: 200
+
+
+            - name: Get all tags from NetBox
+              uri:
+                url: "{{ netbox_url }}/api/extras/tags/"
+                method: GET
+                headers:
+                  Authorization: "Token {{ netbox_api_token }}"
+                return_content: yes
+                status_code: 200
+              register: tags_list
+
+            - name: Set 'pve-provisioned' tag ID
+              set_fact:
+                pve_provisioned_tag_id: >-
+                  {{
+                    tags_list.json.results
+                    | selectattr('name', 'equalto', 'pve-provisioned')
+                    | map(attribute='id')
+                    | first
+                  }}
+
+            - name: Add 'pve-provisioned' tag to the VM in NetBox
+              uri:
+                url: "{{ netbox_url }}/api/virtualization/virtual-machines/{{ netbox_vm_id }}/"
+                method: PATCH
+                headers:
+                  Authorization: "Token {{ netbox_api_token }}"
+                body:
+                  tags:
+                    - "{{ pve_provisioned_tag_id }}"
+                body_format: json
+                status_code: 200
+      
+        - name: Post-deployment configuration
+          debug:
+            msg: "VM {{ vm_name }} with ID {{ target_vm_id }} has been deployed and customized successfully."
