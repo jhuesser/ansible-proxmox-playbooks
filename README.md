@@ -102,7 +102,8 @@ So meanwhile, you can do the following:
 - Size
 - Tag (use the datastore tag)
 3. Copy the `.env.dist` file to `.env` and fill in your netbox and proxmox API token, aswell as your netbox FQDN.
-4. Run `ansible-playbook test-vm-staging-with-lxc.yml --extra-vars NETBOX_VMLXC_ID=4` where `NETBOX_VMLXC_ID` is the ID of the VM/LXC in netbox. You can find it in the URL.
+4. Set the `NETBOX_VMLXC_ID`env variable to the VM ID in netbox. You can find it in the URL.
+5. Run `ansible-playbook test-vm-staging-with-lxc.yml` 
 
 
 # See also

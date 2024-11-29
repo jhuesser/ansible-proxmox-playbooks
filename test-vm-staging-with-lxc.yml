@@ -7,7 +7,7 @@
         netbox_api_token: "{{ lookup('env', 'NETBOX_API_TOKEN') }}"
         api_user: "{{ lookup('env', 'PROXMOX_API_USER') }}"
         api_token: "{{ lookup('env', 'PROXMOX_API_TOKEN') }}"
-        netbox_vm_id: "{{ NETBOX_VMLXC_ID | int }}"  # Passed via extra-vars
+        netbox_vm_id: "{{ lookup('env', 'NETBOX_VMLXC_ID') | int }}"  
       tasks:
         - name: Get VM details from NetBox
           uri:
